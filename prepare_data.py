@@ -72,10 +72,11 @@ def attach_wordpress_categories(records: list[dict]) -> dict:
     if current:
         batches.append(current)
 
-    for batch in batches:
-        args = [('per_page', str(len(batch))), ('_embed', 'wp:term'),
-                ('_fields', 'slug,_embedded')]
-        args.extend(('slug[]', slug) for slug in batch)
+for batch in batches:
+    args = [('per_page', str(len(batch))), ('_embed', 'wp:term'),
+            ('_fields', 'slug,_links,_embedded')]
+    args.extend(('slug[]', slug) for slug in batch)
+
         url = 'https://msk.lodz.pl/wp-json/wp/v2/mec-events?' + urlencode(args)
         request = Request(url, headers={
             'Accept': 'application/json',
