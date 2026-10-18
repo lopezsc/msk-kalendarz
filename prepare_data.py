@@ -9,7 +9,11 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from datetime import date
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+from html import unescape
+import time
 import json
 import re
 import sys
@@ -33,6 +37,101 @@ def month_index(m: str) -> int:
         raise ValueError(f'Nieprawidlowy miesiac: {m}')
     return year * 12 + month - 1
 
+
+
+def attach_wordpress_categories(records: list[dict]) -> dict:
+    """Publiczne MEC/WP REST; etykiety kategorii z WordPress, nigdy z tytulow.
+
+    Brak danych/awaria REST NIE blokuje publikowania poprawnego kalendarza.
+    Jeden slug wydarzenia -> dowolna liczba jego terminow.
+    """
+    base_to_slug = {}
+    for item in records:
+        if item.get('categories'):
+            continue
+        base = item['pageUrl'].split('?', 1)[0]
+        slug = urlparse(base).path.strip('/').split('/')[-1]
+        if slug:
+            base_to_slug[base] = slug
+
+    slugs = sorted(set(base_to_slug.values()))
+    by_slug = {}
+    failures = 0
+    processed = 0
+    # Pakiety oszczedzaja ruch do strony MSK; limit dlugosci URL.
+    batches = []
+    current = []
+    char_count = 0
+    for slug in slugs:
+        if current and (len(current) >= 16 or char_count + len(slug) + 18 > 3800):
+            batches.append(current)
+            current = []
+            char_count = 0
+        current.append(slug)
+        char_count += len(slug) + 18
+    if current:
+        batches.append(current)
+
+    for batch in batches:
+        args = [('per_page', str(len(batch))), ('_embed', 'wp:term'),
+                ('_fields', 'slug,_embedded')]
+        args.extend(('slug[]', slug) for slug in batch)
+        url = 'https://msk.lodz.pl/wp-json/wp/v2/mec-events?' + urlencode(args)
+        request = Request(url, headers={
+            'Accept': 'application/json',
+            'User-Agent': 'MSK-Synchronizator/1.0 (public event categories)',
+        })
+        try:
+            with urlopen(request, timeout=20) as reply:
+                if reply.status != 200:
+                    raise ValueError('HTTP ' + str(reply.status))
+                response = json.load(reply)
+            if not isinstance(response, list):
+                raise ValueError('WP REST odpowiedzial nieprawidlowa struktura')
+            for post in response:
+                slug = post.get('slug')
+                if not isinstance(slug, str) or slug not in batch:
+                    continue
+                categories = set()
+                embedded = post.get('_embedded') or {}
+                for group in embedded.get('wp:term', []):
+                    if not isinstance(group, list):
+                        continue
+                    for term in group:
+                        if isinstance(term, dict) and term.get('taxonomy') == 'mec_category':
+                            name = unescape(str(term.get('name') or '')).strip()
+                            if name:
+                                categories.add(name)
+                if categories:
+                    by_slug[slug] = sorted(categories)
+            processed += len(batch)
+        except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as exc:
+            failures += 1
+            print(f'UWAGA: kategorie WP — partia {len(batch)}: {str(exc)[:140]}', file=sys.stderr)
+            # Jesli endpoint globalnie niedostepny, nie bombardujemy WordPressa.
+            if failures >= 2 and not by_slug:
+                print('UWAGA: Publiczne kategorie niedostepne; pozostawiono bez przypisania.', file=sys.stderr)
+                break
+        time.sleep(0.15)
+
+    filled = 0
+    for record in records:
+        if record.get('categories'):
+            continue
+        base = record['pageUrl'].split('?', 1)[0]
+        labels = by_slug.get(base_to_slug.get(base, ''), [])
+        if labels:
+            record['categories'] = labels
+            filled += 1
+
+    print(f'Kategorie WP: {len(by_slug)} slugow, {filled} terminow uzupelnionych; '
+          f'przetworzono {processed}/{len(slugs)} slugow, nieudane partie: {failures}')
+    return {
+        'categoryMatchedSlugs': len(by_slug),
+        'categoryRequestedSlugs': len(slugs),
+        'categoryFetchFailures': failures,
+        'categoryEnrichedEvents': filled,
+    }
 
 def main() -> int:
     if not INPUT.exists():
@@ -112,6 +211,8 @@ def main() -> int:
     # Bezpiecznik przeciw publikowaniu wyraznie uszkodzonego eksportu.
     if len(clean) < 1000 or any(counts[m] == 0 for m in month_names):
         raise ValueError(f'Za malo danych do publikacji: {len(clean)} terminow, rozklad {dict(counts)}')
+    # Kategorie MEC uzupelniane po walidacji i czyszczeniu terminow.
+    category_quality = attach_wordpress_categories(clean)
     data['events'] = clean
     data['months'] = [dict(c, events=counts[c['month']]) for c in coverage]
     data['quality'] = {
@@ -121,6 +222,7 @@ def main() -> int:
         'recoveredImages': recovered,
         'withoutImage': sum(not e['imageUrl'] for e in clean),
         'withoutCategories': sum(not e['categories'] for e in clean),
+        **category_quality,
     }
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     tmp = OUTPUT.with_suffix('.tmp')
