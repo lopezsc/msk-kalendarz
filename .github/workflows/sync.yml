@@ -1,0 +1,62 @@
+name: MSK - synchronizacja kalendarza
+
+on:
+  schedule:
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: msk-calendar-pages
+  cancel-in-progress: false
+
+jobs:
+  sync-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Pobierz kod
+        uses: actions/checkout@v4
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Instalacja bibliotek i Chromium
+        run: |
+          python -m pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Odczytaj 12 miesiecy z MSK
+        run: python msk_sync.py --months 12 --output msk_events.raw.json
+
+      - name: Zweryfikuj i przygotuj JSON
+        run: python prepare_data.py
+
+      - name: Strona informacyjna i ustawienia Pages
+        run: |
+          printf '<!doctype html><html lang="pl"><meta charset="utf-8"><title>MSK — dane wydarzen</title><body><h1>MSK — dane wydarzen</h1><p><a href="msk_events.json">Aktualny plik JSON</a></p></body></html>\n' > public/index.html
+          touch public/.nojekyll
+
+      - name: Skonfiguruj GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Spakuj zawartosc do publikacji
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: public
+
+      - name: Opublikuj na GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
